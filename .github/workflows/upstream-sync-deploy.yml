@@ -1,0 +1,120 @@
+name: Upstream Sync + Self-host Deploy
+
+# Nightly: merge upstream (every-app/open-seo) into main, then redeploy the
+# Cloudflare self-host stage so the live app tracks upstream releases.
+#
+# Same env-credential model as pr-preview.yml: GitHub Actions sets CI, so
+# alchemy reads CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID from the
+# environment and resolves its state-store token from the account Secrets
+# Store on every run. No `alchemy login` profile is involved.
+#
+# The repository gate keeps this file inert if it is ever merged back
+# upstream into every-app/open-seo.
+#
+# Required repo secrets:
+#   SELFHOST_CLOUDFLARE_API_TOKEN — scoped to the self-host account (Workers
+#     Scripts/KV/D1/R2/Workflows write + Secrets Store write + Account
+#     Settings read + Access apps/policies/organizations write).
+#   SELFHOST_CLOUDFLARE_ACCOUNT_ID — the self-host account ID.
+#   ENV_SELFHOST — full contents of .env.selfhost (DATAFORSEO_API_KEY,
+#     ACCESS_ALLOWED_EMAILS, and any optional integrations).
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # 06:00 UTC nightly
+  workflow_dispatch: {}
+
+# Nightly syncs and manual runs share one lane; a running deploy must finish
+# before the next starts (alchemy reconciles per-resource state).
+concurrency:
+  group: selfhost-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push the merged main
+
+env:
+  CLOUDFLARE_API_TOKEN: ${{ secrets.SELFHOST_CLOUDFLARE_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SELFHOST_CLOUDFLARE_ACCOUNT_ID }}
+
+jobs:
+  sync-and-deploy:
+    if: github.repository == 'buildrtech/open-seo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history, needed to merge upstream
+
+      # Fast-forward when possible; fall back to a merge commit when main has
+      # local commits. A real conflict fails the job — resolve it by hand:
+      #   git fetch https://github.com/every-app/open-seo.git main
+      #   git merge FETCH_HEAD  # resolve, commit, push
+      - name: Merge upstream main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/every-app/open-seo.git
+          git fetch upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date with upstream — nothing to merge or deploy."
+            echo "UP_TO_DATE=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          if ! git merge --no-edit upstream/main; then
+            echo "::error::Merging upstream/main produced conflicts. Resolve manually and push main, then re-run this workflow."
+            exit 1
+          fi
+          git push origin main
+          echo "Merged upstream/main into main ($(git rev-parse --short HEAD))."
+
+      - name: Setup pnpm
+        if: env.UP_TO_DATE != 'true'
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        if: env.UP_TO_DATE != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        if: env.UP_TO_DATE != 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Write .env.selfhost
+        if: env.UP_TO_DATE != 'true'
+        run: printf '%s' "$ENV_SELFHOST" > .env.selfhost
+        env:
+          ENV_SELFHOST: ${{ secrets.ENV_SELFHOST }}
+
+      # Same command as a local self-host deploy: preflight, vite build, tsc,
+      # alchemy deploy --stage selfhost. The deploy re-applies pending D1
+      # migrations and reconciles the Access gate from ACCESS_ALLOWED_EMAILS.
+      - name: Deploy self-host stage
+        if: env.UP_TO_DATE != 'true'
+        run: pnpm deploy:selfhost --yes
+
+      # Fail the run if the app answers without the Cloudflare Access login
+      # redirect — the gate is the only thing between the app and the public.
+      - name: Verify Access protection
+        if: env.UP_TO_DATE != 'true'
+        env:
+          SELFHOST_URL: https://open-seo-selfhost.buildr-marketing-seo.workers.dev
+        run: |
+          for attempt in 1 2 3 4 5 6 7 8; do
+            response=$(curl -sS -o /dev/null -m 10 -w '%{http_code} %{redirect_url}' "$SELFHOST_URL") || response=""
+            location="${response#* }"
+            case "$location" in
+              https://*.cloudflareaccess.com/cdn-cgi/access/login*)
+                exit 0 ;;
+            esac
+            echo "attempt $attempt: not up yet (${response:-no response})"
+            sleep 5
+          done
+          echo "::error::Could not verify Cloudflare Access protection for $SELFHOST_URL after 8 attempts; verify manually before sharing the app"
+          exit 1
