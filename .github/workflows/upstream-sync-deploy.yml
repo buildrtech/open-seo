@@ -18,6 +18,9 @@ name: Upstream Sync + Self-host Deploy
 #   SELFHOST_CLOUDFLARE_ACCOUNT_ID — the self-host account ID.
 #   ENV_SELFHOST — full contents of .env.selfhost (DATAFORSEO_API_KEY,
 #     ACCESS_ALLOWED_EMAILS, and any optional integrations).
+#   UPSTREAM_SYNC_TOKEN — fine-grained PAT on this repo with Contents and
+#     Workflows write. GITHUB_TOKEN can never push changes to
+#     .github/workflows/, which upstream merges regularly include.
 
 on:
   schedule:
@@ -48,6 +51,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0 # full history, needed to merge upstream
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }} # push upstream workflow-file changes
 
       # Fast-forward when possible; fall back to a merge commit when main has
       # local commits. A real conflict fails the job — resolve it by hand:
@@ -101,13 +105,14 @@ jobs:
 
       # Fail the run if the app answers without the Cloudflare Access login
       # redirect — the gate is the only thing between the app and the public.
+      # Access only redirects browser requests; others get a 401 OAuth challenge.
       - name: Verify Access protection
         if: env.UP_TO_DATE != 'true'
         env:
           SELFHOST_URL: https://open-seo-selfhost.buildr-marketing-seo.workers.dev
         run: |
           for attempt in 1 2 3 4 5 6 7 8; do
-            response=$(curl -sS -o /dev/null -m 10 -w '%{http_code} %{redirect_url}' "$SELFHOST_URL") || response=""
+            response=$(curl -sS -o /dev/null -m 10 -H 'Accept: text/html' -w '%{http_code} %{redirect_url}' "$SELFHOST_URL") || response=""
             location="${response#* }"
             case "$location" in
               https://*.cloudflareaccess.com/cdn-cgi/access/login*)
